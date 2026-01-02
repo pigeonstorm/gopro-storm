@@ -1,6 +1,6 @@
-# GoPro File Import Script
+# GoPro Storm ⚡️
 
-This Ruby script automatically imports GoPro files from an SD card and organizes them by week and year based on their metadata.
+Backup your GoPro from the terminal using a lightweight Ruby script. Avoid buggy official apps and OS-native software—this script automatically imports your files and organizes them into clean, week-based folders using EXIF metadata.
 
 ## Features
 
