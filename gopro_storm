@@ -1,0 +1,408 @@
+#!/usr/bin/env ruby
+# GoPro File Import and Organization Script
+# This script imports GoPro files from an SD card and organizes them by week and year
+
+require 'fileutils'
+require 'date'
+require 'mini_exiftool'
+require 'ruby-progressbar'
+require 'optparse'
+
+class GoProImporter
+  GOPRO_EXTENSIONS = ['.mp4', '.mov', '.jpg', '.jpeg', '.raw', '.gpr']
+  DEFAULT_DESTINATION_PATH = "/Users/#{ENV['USER']}/Gopro"
+
+  # UI symbols and colors
+  COLOR_GREEN = "\e[32m"
+  COLOR_RED = "\e[31m"
+  COLOR_RESET = "\e[0m"
+  PASS_SYMBOL = "#{COLOR_GREEN}✔#{COLOR_RESET}"
+  FAIL_SYMBOL = "#{COLOR_RED}✘#{COLOR_RESET}"
+
+  # Common volume mount points to check for GoPro data
+  COMMON_VOLUMES = [
+    '/Volumes',      # macOS
+    '/media',        # Linux
+    '/mnt',          # Linux alternative
+  ]
+
+  def initialize(source_paths, destination_path = Dir.pwd, dry_run = false, max_files = nil)
+    @source_paths = Array(source_paths) # Ensure it's always an array
+    @destination_path = destination_path
+    @dry_run = dry_run
+    @max_files = max_files
+    @processed_files = 0
+    @errors = []
+    @progress_bar = nil
+  end
+
+  def run
+    puts "GoPro Import Script"
+    puts "=================="
+    puts "Sources: #{@source_paths.join(', ')}"
+    puts "Destination: #{@destination_path}"
+    puts "Mode: #{@dry_run ? 'DRY RUN (no files will be copied)' : 'LIVE RUN'}"
+    puts ""
+
+    validate_paths
+    process_files
+    print_summary
+  end
+
+  private
+
+  def validate_paths
+    @source_paths.each do |source_path|
+      unless Dir.exist?(source_path)
+        raise "Source path does not exist: #{source_path}"
+      end
+    end
+
+    unless Dir.exist?(@destination_path)
+      puts "Creating destination directory: #{@destination_path}"
+      FileUtils.mkdir_p(@destination_path)
+      puts "#{PASS_SYMBOL} Destination directory created."
+    end
+  end
+
+  def process_files
+    puts "Scanning for GoPro files..."
+
+    gopro_files = find_gopro_files
+
+    # Limit files in dry-run mode if max_files is specified
+    if @dry_run && @max_files && gopro_files.length > @max_files
+      puts "Found #{gopro_files.length} GoPro files (limiting to #{@max_files} for dry-run)"
+      gopro_files = gopro_files.first(@max_files)
+    else
+      puts "Found #{gopro_files.length} GoPro files"
+    end
+    puts ""
+
+    # Initialize progress bar
+    @progress_bar = ProgressBar.create(
+      total: gopro_files.length,
+      title: 'Processing files',
+      format: '%t: %c/%C |%B| %p%%',
+      progress_mark: '█',
+      remainder_mark: '░',
+      starting_at: 0
+    )
+
+    gopro_files.each do |file_path|
+      process_file(file_path)
+    end
+
+    @progress_bar.finish
+    puts "\n"
+  end
+
+  # Detect volumes that contain GoPro data
+  def self.detect_gopro_volumes
+    detected_volumes = []
+
+    COMMON_VOLUMES.each do |base_path|
+      next unless Dir.exist?(base_path)
+
+      begin
+        Dir.glob("#{base_path}/*").each do |volume_path|
+          next unless Dir.exist?(volume_path)
+          next if volume_path.end_with?('/.Trashes') # Skip macOS trash
+          next if volume_path == '/Volumes/Macintosh HD' # Always skip system drive
+
+          begin
+            if contains_gopro_data?(volume_path)
+              detected_volumes << volume_path
+            end
+          rescue
+            # Skip volumes we can't access
+            next
+          end
+        end
+      rescue
+        # Skip base paths we can't access
+        next
+      end
+    end
+
+    detected_volumes
+  end
+
+  # Check if a volume contains GoPro data
+  def self.contains_gopro_data?(volume_path)
+    # Check for common GoPro directory structures
+    gopro_indicators = [
+      "#{volume_path}/DCIM/100GOPRO",
+      "#{volume_path}/DCIM/101GOPRO",
+      "#{volume_path}/DCIM/102GOPRO",
+      "#{volume_path}/MISC"
+    ]
+
+    gopro_indicators.each do |indicator_path|
+      return true if Dir.exist?(indicator_path)
+    end
+
+    # Check for GoPro files in the root or DCIM directory
+    ['.', 'DCIM'].each do |subdir|
+      check_path = subdir == '.' ? volume_path : "#{volume_path}/#{subdir}"
+      next unless Dir.exist?(check_path)
+
+      begin
+        Dir.glob("#{check_path}/**/*").each do |file|
+          next unless File.file?(file)
+          filename = File.basename(file)
+          return true if filename =~ /GOPR\d{4}\./i || filename =~ /GP\d{2}\d{4}\./i
+        end
+      rescue
+        # Skip directories we can't access
+        next
+      end
+    end
+
+    false
+  end
+
+  def find_gopro_files
+    files = []
+
+    @source_paths.each do |source_path|
+      # Search recursively in each source path
+      # This avoids duplicate searches in overlapping directories
+      Dir.glob(File.join(source_path, '**', '*')).each do |file|
+        next unless File.file?(file)
+        next unless gopro_file?(file)
+
+        files << file
+      end
+    end
+
+    files.uniq # Remove any potential duplicates
+  end
+
+  def gopro_file?(file_path)
+    extension = File.extname(file_path).downcase
+    GOPRO_EXTENSIONS.include?(extension) ||
+    file_path =~ /GOPR\d{4}\./i ||  # GOPR0001.MP4 pattern
+    file_path =~ /GP\d{2}\d{4}\./i || # GP011234.MP4 pattern
+    file_path =~ /GX\d{2}\d{4}\./i || # GX011234.MP4 pattern
+    file_path =~ /GH\d{2}\d{4}\./i    # GH011234.MP4 pattern
+  end
+
+  def process_file(file_path)
+    begin
+      metadata = extract_metadata(file_path)
+      creation_date = determine_creation_date(metadata, file_path)
+
+      return unless creation_date
+
+      week_dir = create_week_directory(creation_date)
+      copy_file_to_directory(file_path, week_dir)
+
+      @processed_files += 1
+
+      @progress_bar.increment
+    rescue => e
+      @errors << "#{file_path}: #{e.message}"
+      @progress_bar.increment
+    end
+  end
+
+  def extract_metadata(file_path)
+    begin
+      exif = MiniExiftool.new(file_path)
+      return exif if exif && exif.errors.empty?
+    rescue => e
+      # Silently handle metadata extraction errors
+    end
+
+    nil
+  end
+
+  def determine_creation_date(metadata, file_path)
+    # If we have metadata, try to extract date from it
+    if metadata
+      # Try various date fields that GoPro files might have
+      date_fields = [
+        :date_time_original,
+        :create_date,
+        :date_time,
+        :modify_date,
+        :file_modify_date
+      ]
+
+      date_fields.each do |field|
+        date_value = metadata[field]
+        next unless date_value
+
+        begin
+          # Handle different date formats
+          if date_value.is_a?(String)
+            # Parse string dates
+            parsed_date = DateTime.parse(date_value)
+            return parsed_date.to_date
+          elsif date_value.is_a?(DateTime) || date_value.is_a?(Date)
+            return date_value.to_date
+          end
+        rescue => e
+          # Silently skip unparseable dates during processing
+          next
+        end
+      end
+    end
+
+    # Fallback to file modification time
+    # Note: Warnings are suppressed during progress bar display to keep output clean
+    File.mtime(file_path).to_date
+  rescue => e
+    puts "Error determining creation date for #{File.basename(file_path)}: #{e.message}"
+    nil
+  end
+
+  def create_week_directory(date)
+    year = date.year
+    week = date.cweek.to_s.rjust(2, '0')  # Zero-pad week number
+
+    dir_name = "week_#{week}_#{year}"
+    dir_path = File.join(@destination_path, dir_name)
+
+    unless @dry_run
+      FileUtils.mkdir_p(dir_path) unless Dir.exist?(dir_path)
+    end
+
+    dir_path
+  end
+
+  def copy_file_to_directory(source_file, destination_dir)
+    filename = File.basename(source_file)
+    destination_file = File.join(destination_dir, filename)
+
+    # Handle duplicate filenames by adding a suffix
+    counter = 1
+    base_name = File.basename(filename, '.*')
+    extension = File.extname(filename)
+
+    while File.exist?(destination_file)
+      new_filename = "#{base_name}_#{counter}#{extension}"
+      destination_file = File.join(destination_dir, new_filename)
+      counter += 1
+    end
+
+    unless @dry_run
+      FileUtils.cp(source_file, destination_file, preserve: true)
+    end
+  end
+
+  def print_summary
+    puts ""
+    puts "Import Summary"
+    puts "=============="
+    puts "Files processed: #{@processed_files}"
+    puts "Mode: #{@dry_run ? 'DRY RUN (preview only)' : 'LIVE RUN'}"
+
+    if @errors.any?
+      puts "#{FAIL_SYMBOL} #{COLOR_RED}Errors encountered:#{COLOR_RESET}"
+      @errors.each { |error| puts "  - #{error}" }
+    end
+
+    puts ""
+    if @errors.empty? && @processed_files > 0
+      puts "#{PASS_SYMBOL} #{COLOR_GREEN}#{@dry_run ? 'Dry run' : 'Import'} completed successfully!#{COLOR_RESET}"
+    elsif @processed_files == 0 && @errors.empty?
+      puts "No files were processed."
+    else
+      puts "#{FAIL_SYMBOL} #{COLOR_RED}#{@dry_run ? 'Dry run' : 'Import'} completed with errors.#{COLOR_RESET}"
+    end
+  end
+end
+
+# Main execution
+if __FILE__ == $0
+  options = {}
+  option_parser = OptionParser.new do |opts|
+    opts.banner = "Usage: ruby gopro_import.rb [options] [source_path...] [destination_path]"
+    opts.separator ""
+    opts.separator "Arguments:"
+    opts.separator "  source_path      - Path(s) to SD card(s) or directory containing GoPro files"
+    opts.separator "                     (if not specified, auto-detects GoPro volumes)"
+    opts.separator "  destination_path - Optional: Directory to import files to (defaults to current directory)"
+    opts.separator ""
+    opts.separator "Options:"
+
+    opts.on("--volumes V1,V2", Array, "Specify volumes to scan (comma-separated)") do |volumes|
+      options[:volumes] = volumes
+    end
+
+    opts.on("--auto-detect", "Auto-detect GoPro volumes (default when no source_path given)") do
+      options[:auto_detect] = true
+    end
+
+    opts.on("--dry-run", "Show what would be done without actually copying files") do
+      options[:dry_run] = true
+    end
+
+    opts.on("--limit N", Integer, "Limit number of files to process in dry-run mode (for testing)") do |n|
+      options[:max_files] = n
+    end
+
+    opts.on("-h", "--help", "Show this help message") do
+      puts opts
+      exit
+    end
+
+    opts.separator ""
+    opts.separator "Examples:"
+    opts.separator "  ruby gopro_import.rb                           # Auto-detect GoPro volumes"
+    opts.separator "  ruby gopro_import.rb /Volumes/UNTITLED         # Import from specific volume"
+    opts.separator "  ruby gopro_import.rb --volumes /Volumes/A,/Volumes/B  # Import from multiple volumes"
+    opts.separator "  ruby gopro_import.rb --dry-run                  # Preview auto-detected volumes"
+    opts.separator "  ruby gopro_import.rb --dry-run --limit 5        # Preview with only 5 files (fast testing)"
+    opts.separator "  ruby gopro_import.rb /Volumes/UNTITLED #{DEFAULT_DESTINATION_PATH}"
+  end
+
+  begin
+    option_parser.parse!
+
+    # Determine source paths
+    source_paths = if options[:volumes]
+      # Use explicitly specified volumes
+      options[:volumes]
+    elsif !ARGV.empty? && !options[:auto_detect]
+      # Use command line arguments as source paths
+      ARGV.take_while { |arg| !arg.start_with?('--') && arg != Dir.pwd }
+    else
+      # Auto-detect GoPro volumes
+      puts "Auto-detecting GoPro volumes..."
+      detected = GoProImporter.detect_gopro_volumes
+      if detected.empty?
+        puts "#{GoProImporter::FAIL_SYMBOL} #{GoProImporter::COLOR_RED}No GoPro volumes detected.#{GoProImporter::COLOR_RESET}"
+        puts "Please specify volumes manually using --volumes or provide source paths directly."
+        puts "Example: ruby gopro_import.rb /Volumes/UNTITLED"
+        exit 1
+      end
+      puts "#{GoProImporter::PASS_SYMBOL} Found GoPro volumes: #{detected.join(', ')}"
+      detected
+    end
+
+    # Extract destination path (last argument if it looks like a path and not an option)
+    destination_path = DEFAULT_DESTINATION_PATH
+    if !ARGV.empty? && ARGV.last != source_paths.last && !ARGV.last.start_with?('--')
+      destination_path = ARGV.last
+    end
+
+    if source_paths.empty?
+      puts "No source paths specified and auto-detection found no GoPro volumes."
+      puts option_parser
+      exit 1
+    end
+
+    importer = GoProImporter.new(source_paths, destination_path, options[:dry_run], options[:max_files])
+    importer.run
+  rescue OptionParser::InvalidOption => e
+    puts "#{GoProImporter::FAIL_SYMBOL} #{GoProImporter::COLOR_RED}Error: #{e.message}#{GoProImporter::COLOR_RESET}"
+    puts option_parser
+    exit 1
+  rescue => e
+    puts "#{GoProImporter::FAIL_SYMBOL} #{GoProImporter::COLOR_RED}Error: #{e.message}#{GoProImporter::COLOR_RESET}"
+    exit 1
+  end
+end
