@@ -8,9 +8,10 @@ require 'mini_exiftool'
 require 'ruby-progressbar'
 require 'optparse'
 
+DEFAULT_DESTINATION_PATH = "/Users/#{ENV['USER']}/Gopro"
+
 class GoProImporter
   GOPRO_EXTENSIONS = ['.mp4', '.mov', '.jpg', '.jpeg', '.raw', '.gpr']
-  DEFAULT_DESTINATION_PATH = "/Users/#{ENV['USER']}/Gopro"
 
   # UI symbols and colors
   COLOR_GREEN = "\e[32m"
