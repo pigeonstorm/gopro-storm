@@ -6,22 +6,231 @@ require 'fileutils'
 require 'date'
 require 'digest'
 require 'mini_exiftool'
-require 'ruby-progressbar'
 require 'optparse'
 
 DEFAULT_DESTINATION_PATH = "/Users/#{ENV['USER']}/Gopro"
 
+# A small btop-inspired terminal UI: rounded panels with bracketed titles,
+# aligned key/value rows, and a smooth gradient progress bar that redraws in
+# place. Falls back to plain, color-free output when stdout is not a TTY.
+class UI
+  RESET = "\e[0m"
+  BOLD  = "\e[1m"
+  ANSI  = /\e\[[0-9;]*m/
+  # Eighth-block characters for sub-cell bar resolution (btop-style smoothness)
+  BLOCKS = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'].freeze
+  SYMBOLS = { ok: '✔', warn: '⚠', err: '✘', info: '•', go: '⟳' }.freeze
+
+  def initialize(io = $stdout)
+    @io = io
+    @rich = io.respond_to?(:tty?) && io.tty? && ENV['NO_COLOR'].to_s.empty?
+    # Prefer 24-bit true-color when the terminal advertises it (smoother
+    # gradients); otherwise fall back to the widely-supported 256-color cube.
+    @truecolor = @rich && ENV['COLORTERM'].to_s.match?(/(truecolor|24bit)/i)
+    @gradient = [[0x29, 0x9b, 0xff], [0x2d, 0xd5, 0x96], [0xa6, 0xff, 0x96]]
+    @p_lines = 0
+  end
+
+  def rich?
+    @rich
+  end
+
+  def width
+    @width ||= begin
+      cols = nil
+      begin
+        require 'io/console'
+        cols = IO.console && IO.console.winsize.last
+      rescue StandardError
+        cols = nil
+      end
+      cols = ENV['COLUMNS'].to_i if (cols.nil? || cols.zero?) && ENV['COLUMNS'].to_i.positive?
+      cols = 88 if cols.nil? || cols.zero?
+      [[cols, 100].min, 46].max
+    end
+  end
+
+  def content_width
+    width - 4
+  end
+
+  # Emit a foreground color escape: 24-bit true-color when supported, else the
+  # xterm 256-color cube (broad support, e.g. macOS Terminal.app lacks 24-bit).
+  def color(r, g, b)
+    return '' unless @rich
+    return "\e[38;2;#{r};#{g};#{b}m" if @truecolor
+
+    idx = 16 + (36 * quant(r)) + (6 * quant(g)) + quant(b)
+    "\e[38;5;#{idx}m"
+  end
+
+  def reset; @rich ? RESET : ''; end
+  def bold;  @rich ? BOLD : ''; end
+
+  # Theme palette
+  def c_border = color(0x3a, 0x47, 0x73)
+  def c_title  = color(0x7b, 0xd6, 0xff)
+  def c_label  = color(0x96, 0x9e, 0xb4)
+  def c_value  = color(0xe4, 0xe6, 0xec)
+  def c_dim    = color(0x58, 0x5e, 0x70)
+  def c_ok     = color(0x78, 0xe3, 0x8c)
+  def c_warn   = color(0xff, 0xd1, 0x66)
+  def c_err    = color(0xff, 0x5c, 0x6c)
+
+  def visible(str)
+    str.gsub(ANSI, '').length
+  end
+
+  def clip(text, max)
+    text = text.to_s
+    return text if text.length <= max
+    return text[0, [max, 0].max].to_s if max <= 1
+
+    "…#{text[-(max - 1), max - 1]}"
+  end
+
+  # Draw a rounded panel. `lines` are pre-built (optionally colored) strings.
+  def box(title, lines)
+    unless @rich
+      @io.puts
+      @io.puts(title.to_s.upcase) if title
+      lines.each { |line| @io.puts "  #{line.gsub(ANSI, '')}" }
+      return
+    end
+
+    @io.puts top_border(title)
+    lines.each { |line| @io.puts row(line) }
+    @io.puts bottom_border
+  end
+
+  def top_border(title)
+    return "#{c_border}╭#{'─' * (width - 2)}╮#{reset}" unless title
+
+    label = clip(title, width - 9)
+    fill = [width - 7 - label.length, 0].max
+    "#{c_border}╭─┤#{reset}#{c_title}#{bold} #{label} #{reset}#{c_border}├#{'─' * fill}╮#{reset}"
+  end
+
+  def bottom_border
+    "#{c_border}╰#{'─' * (width - 2)}╯#{reset}"
+  end
+
+  def row(content)
+    pad = [content_width - visible(content), 0].max
+    "#{c_border}│#{reset} #{content}#{' ' * pad} #{c_border}│#{reset}"
+  end
+
+  # Build an aligned "label   value" row string for use inside a box.
+  def kv(label, value, label_width)
+    lbl = label.to_s.ljust(label_width)
+    avail = [content_width - label_width - 1, 0].max
+    "#{c_label}#{lbl}#{reset} #{c_value}#{clip(value, avail)}#{reset}"
+  end
+
+  def item(kind, text)
+    @io.puts "#{kind_color(kind)}#{SYMBOLS[kind]}#{reset} #{text}"
+  end
+
+  def note(text)
+    @io.puts "#{c_dim}#{text}#{reset}"
+  end
+
+  def blank
+    @io.puts
+  end
+
+  def colorize(kind, text)
+    "#{kind_color(kind)}#{text}#{reset}"
+  end
+
+  # Render a gradient bar `length` cells wide for `fraction` in 0..1.
+  def bar(fraction, length)
+    fraction = 0.0 if fraction.negative?
+    fraction = 1.0 if fraction > 1
+    return ('#' * (fraction * length).round).ljust(length, '.') unless @rich
+
+    eighths = (fraction * length * 8).round
+    full = eighths / 8
+    rem = eighths % 8
+    out = +''
+    length.times do |i|
+      if i < full
+        out << gradient(i, length) << '█'
+      elsif i == full && rem.positive?
+        out << gradient(i, length) << BLOCKS[rem]
+      else
+        out << c_dim << '░'
+      end
+    end
+    out << reset
+  end
+
+  # --- live progress panel ---
+
+  def progress_start(total, title)
+    @p_total = total
+    @p_title = title
+    @p_lines = 0
+    @io.puts "Processing #{total} file(s)..." unless @rich
+  end
+
+  def progress(done, file, dir, action)
+    unless @rich
+      @io.puts "[#{done}/#{@p_total}] #{action}: #{file}"
+      return
+    end
+
+    lines = progress_lines(done, file, dir, action)
+    @io.print "\e[#{@p_lines}A" if @p_lines.positive?
+    lines.each { |line| @io.print "\r\e[2K#{line}\n" }
+    @p_lines = lines.length
+    @io.flush
+  end
+
+  def progress_finish
+    @io.puts if @rich
+  end
+
+  private
+
+  def quant(component)
+    (component * 5 / 255.0).round
+  end
+
+  def kind_color(kind)
+    { ok: c_ok, warn: c_warn, err: c_err, info: c_label, go: c_title }[kind] || ''
+  end
+
+  def gradient(index, length)
+    return '' unless @rich
+
+    t = length <= 1 ? 0.0 : index.to_f / (length - 1)
+    seg = t * (@gradient.length - 1)
+    i = [seg.floor, @gradient.length - 2].min
+    f = seg - i
+    a = @gradient[i]
+    b = @gradient[i + 1]
+    color(*[0, 1, 2].map { |k| (a[k] + ((b[k] - a[k]) * f)).round })
+  end
+
+  def progress_lines(done, file, dir, action)
+    fraction = @p_total.positive? ? done.to_f / @p_total : 1.0
+    pct = (fraction * 100).round
+    suffix = "#{pct.to_s.rjust(3)}%  #{c_dim}#{done}/#{@p_total}#{reset}"
+    label_width = 5
+    bar_len = [content_width - visible(suffix) - 2, 10].max
+    [
+      top_border(@p_title),
+      row(kv('file', "#{action}  #{file}", label_width)),
+      row(kv('dir', dir || '—', label_width)),
+      row("#{bar(fraction, bar_len)}  #{c_value}#{suffix}"),
+      bottom_border
+    ]
+  end
+end
+
 class GoProImporter
   GOPRO_EXTENSIONS = ['.mp4', '.mov', '.jpg', '.jpeg', '.raw', '.gpr']
-
-  # UI symbols and colors
-  COLOR_GREEN = "\e[32m"
-  COLOR_RED = "\e[31m"
-  COLOR_YELLOW = "\e[33m"
-  COLOR_RESET = "\e[0m"
-  PASS_SYMBOL = "#{COLOR_GREEN}✔#{COLOR_RESET}"
-  FAIL_SYMBOL = "#{COLOR_RED}✘#{COLOR_RESET}"
-  WARN_SYMBOL = "#{COLOR_YELLOW}⚠#{COLOR_RESET}"
 
   # Common volume mount points to check for GoPro data
   COMMON_VOLUMES = [
@@ -45,19 +254,12 @@ class GoProImporter
     @duplicate_skipped = 0
     @deleted_sources = 0
     @errors = []
-    @progress_bar = nil
     @md5_cache = {}
+    @ui = UI.new
   end
 
   def run
-    puts "GoPro Import Script"
-    puts "=================="
-    puts "Sources: #{@source_paths.join(', ')}"
-    puts "Destination: #{@destination_path}"
-    puts "Mode: #{mode_label}"
-    puts "Since: #{@since_date}" if @since_date
-    puts "Until: #{@until_date}" if @until_date
-    puts ""
+    print_header
 
     validate_paths
 
@@ -69,6 +271,18 @@ class GoProImporter
       process_files
       print_summary
     end
+  end
+
+  def print_header
+    lw = 12
+    rows = [
+      @ui.kv('Sources', @source_paths.join(', '), lw),
+      @ui.kv('Destination', @destination_path, lw),
+      @ui.kv('Mode', mode_label, lw)
+    ]
+    rows << @ui.kv('Since', @since_date.to_s, lw) if @since_date
+    rows << @ui.kv('Until', @until_date.to_s, lw) if @until_date
+    @ui.box('gopro storm', rows)
   end
 
   def mode_label
@@ -99,48 +313,37 @@ class GoProImporter
         raise "Destination path does not exist: #{@destination_path}"
       end
     elsif !Dir.exist?(@destination_path)
-      puts "Creating destination directory: #{@destination_path}"
+      @ui.note("Creating destination directory: #{@destination_path}")
       FileUtils.mkdir_p(@destination_path)
-      puts "#{PASS_SYMBOL} Destination directory created."
+      @ui.item(:ok, 'Destination directory created.')
     end
   end
 
   def process_files
-    puts "Scanning for GoPro files..."
+    @ui.note('Scanning for GoPro files…')
 
     gopro_files = find_gopro_files
 
     # Limit files in dry-run mode if max_files is specified
     if @dry_run && @max_files && gopro_files.length > @max_files
-      puts "Found #{gopro_files.length} GoPro files (limiting to #{@max_files} for dry-run)"
+      @ui.item(:info, "Found #{gopro_files.length} GoPro files (limiting to #{@max_files} for dry-run)")
       gopro_files = gopro_files.first(@max_files)
     else
-      puts "Found #{gopro_files.length} GoPro files"
+      @ui.item(:info, "Found #{gopro_files.length} GoPro files")
     end
-    puts ""
+    @ui.blank
 
-    # Two status lines that are kept updated just above the progress bar:
-    #   line 1: full output directory of the file currently being copied
-    #   line 2: the file currently being copied
-    puts "Output : #{@destination_path}"
-    puts "Copying: "
+    title = @delete_after ? 'Moving' : 'Importing'
+    @ui.progress_start(gopro_files.length, title)
 
-    # Initialize progress bar (rendered on the line directly below the status)
-    @progress_bar = ProgressBar.create(
-      total: gopro_files.length,
-      title: 'Processing files',
-      format: '%t: %c/%C |%B| %p%%',
-      progress_mark: '█',
-      remainder_mark: '░',
-      starting_at: 0
-    )
-
+    done = 0
     gopro_files.each do |file_path|
       process_file(file_path)
+      done += 1
+      @ui.progress(done, @current_file, @current_dir, @current_action)
     end
 
-    @progress_bar.finish
-    puts "\n"
+    @ui.progress_finish
   end
 
   # Detect volumes that contain GoPro data
@@ -235,6 +438,10 @@ class GoProImporter
   end
 
   def process_file(file_path)
+    @current_file = File.basename(file_path)
+    @current_dir = nil
+    @current_action = 'scan'
+
     begin
       # Fast pre-filter using mtime to avoid expensive EXIF reads.
       # mtime is typically >= creation date, so if mtime is too old
@@ -242,6 +449,7 @@ class GoProImporter
       file_mtime = File.mtime(file_path).to_date
       if @since_date && file_mtime < @since_date
         @skipped_files += 1
+        @current_action = 'skip·date'
         return
       end
       # For --until, skip if mtime is after the cutoff. Since mtime >= creation date,
@@ -254,58 +462,29 @@ class GoProImporter
 
       if @since_date && creation_date < @since_date
         @skipped_files += 1
+        @current_action = 'skip·date'
         return
       end
 
       if @until_date && creation_date > @until_date
         @skipped_files += 1
+        @current_action = 'skip·date'
         return
       end
 
       week_dir = create_week_directory(creation_date)
-      update_status(week_dir, File.basename(file_path))
+      @current_dir = week_dir
       status = copy_file_to_directory(file_path, week_dir)
 
-      @processed_files += 1 if status == :copied
-
-      @progress_bar.increment
+      if status == :copied
+        @processed_files += 1
+        @current_action = @delete_after ? 'move' : 'copy'
+      else
+        @current_action = 'skip·dup'
+      end
     rescue => e
       @errors << "#{file_path}: #{e.message}"
-      @progress_bar.increment
-    end
-  end
-
-  # Refresh the two status lines that sit directly above the progress bar
-  # without disturbing the bar itself. The cursor is assumed to be on the bar
-  # line, so we move up two rows, rewrite both lines, then return to the bar.
-  def update_status(output_dir, filename)
-    out_line = fit_line("Output : ", output_dir)
-    file_line = fit_line("Copying: ", filename)
-    # \e[2A : up two lines, \r : column 0, \e[2K : clear whole line
-    print "\e[2A\r\e[2K#{out_line}\n\r\e[2K#{file_line}\n\r"
-    $stdout.flush
-  end
-
-  # Keep a status line within the terminal width so it never wraps (which would
-  # break the cursor math above). Long values are elided from the left so the
-  # most relevant tail (week directory / filename) stays visible.
-  def fit_line(label, value)
-    max = terminal_width - 1
-    line = "#{label}#{value}"
-    return line if line.length <= max
-
-    available = max - label.length - 1
-    return line[0, max] if available <= 0
-
-    "#{label}…#{value[-available, available]}"
-  end
-
-  def terminal_width
-    @terminal_width ||= begin
-      require 'io/console'
-      (IO.console && IO.console.winsize.last) || 80
-    rescue
-      80
+      @current_action = 'error'
     end
   end
 
@@ -484,8 +663,8 @@ class GoProImporter
     source_files = collect_source_files
     destination_index = build_destination_index
 
-    puts "Comparing MD5 of #{source_files.length} source file(s) against destination copies..."
-    puts ""
+    @ui.note("Comparing MD5 of #{source_files.length} source file(s) against destination copies…")
+    @ui.blank
 
     matched = 0
     mismatched = 0
@@ -497,7 +676,7 @@ class GoProImporter
 
       if candidates.empty?
         missing += 1
-        puts "#{FAIL_SYMBOL} #{COLOR_RED}Missing#{COLOR_RESET}: #{basename} (no copy found in destination)"
+        @ui.item(:err, "#{@ui.colorize(:err, 'missing')}  #{basename} (no copy found in destination)")
         next
       end
 
@@ -505,25 +684,25 @@ class GoProImporter
 
       if candidates.any? { |candidate| file_md5(candidate) == source_digest }
         matched += 1
-        puts "#{PASS_SYMBOL} #{basename}"
+        @ui.item(:ok, basename)
       else
         mismatched += 1
-        puts "#{WARN_SYMBOL} #{COLOR_YELLOW}MD5 mismatch#{COLOR_RESET}: #{basename} (copy exists but checksum differs)"
+        @ui.item(:warn, "#{@ui.colorize(:warn, 'mismatch')}  #{basename} (copy exists but checksum differs)")
       end
     end
 
-    puts ""
-    puts "Check Summary"
-    puts "============="
-    puts "#{PASS_SYMBOL} Verified (MD5 match): #{matched}"
-    puts "#{WARN_SYMBOL} MD5 mismatch: #{mismatched}" if mismatched > 0
-    puts "#{FAIL_SYMBOL} Missing from destination: #{missing}" if missing > 0
-    puts ""
+    @ui.blank
+    lw = 12
+    rows = [@ui.kv('Verified', matched, lw)]
+    rows << @ui.kv('Mismatch', mismatched, lw) if mismatched > 0
+    rows << @ui.kv('Missing', missing, lw) if missing > 0
+    @ui.box('Check summary', rows)
 
+    @ui.blank
     if mismatched.zero? && missing.zero?
-      puts "#{PASS_SYMBOL} #{COLOR_GREEN}All source files have a verified copy in the destination.#{COLOR_RESET}"
+      @ui.item(:ok, @ui.colorize(:ok, 'All source files have a verified copy in the destination.'))
     else
-      puts "#{FAIL_SYMBOL} #{COLOR_RED}Some files are missing or do not match their copy.#{COLOR_RESET}"
+      @ui.item(:err, @ui.colorize(:err, 'Some files are missing or do not match their copy.'))
     end
   end
 
@@ -531,8 +710,8 @@ class GoProImporter
     source_files = collect_source_files
     destination_index = build_destination_index
 
-    puts "Cleaning #{source_files.length} source file(s) with a verified copy in destination..."
-    puts ""
+    @ui.note("Cleaning #{source_files.length} source file(s) with a verified copy in destination…")
+    @ui.blank
 
     deleted = 0
     skipped = 0
@@ -544,61 +723,56 @@ class GoProImporter
 
       if candidates.empty?
         skipped += 1
-        puts "#{COLOR_YELLOW}Skip#{COLOR_RESET}: #{basename} (no file found in destination)"
+        @ui.item(:info, "#{@ui.colorize(:info, 'skip')}  #{basename} (no file found in destination)")
         next
       end
 
       source_digest = file_md5(source_file)
 
       if candidates.any? { |candidate| file_md5(candidate) == source_digest }
-        if @dry_run
-          puts "#{PASS_SYMBOL} Would delete: #{basename} (verified copy exists)"
-        else
-          File.delete(source_file)
-          puts "#{PASS_SYMBOL} Deleted: #{basename} (verified copy exists)"
-        end
+        File.delete(source_file) unless @dry_run
+        verb = @dry_run ? 'would delete' : 'deleted'
+        @ui.item(:ok, "#{@ui.colorize(:ok, verb)}  #{basename} (verified copy exists)")
         deleted += 1
       else
         warnings += 1
-        puts "#{WARN_SYMBOL} #{COLOR_YELLOW}Warning#{COLOR_RESET}: MD5 mismatch for #{basename} — copy exists but differs, not deleting."
+        @ui.item(:warn, "#{@ui.colorize(:warn, 'mismatch')}  #{basename} — copy exists but differs, not deleting.")
       end
     end
 
-    puts ""
-    puts "Clean Summary"
-    puts "============="
-    puts "#{PASS_SYMBOL} #{@dry_run ? 'Would delete' : 'Deleted'} (verified copy): #{deleted}"
-    puts "#{COLOR_YELLOW}Skipped (no copy found): #{skipped}#{COLOR_RESET}" if skipped > 0
-    puts "#{WARN_SYMBOL} #{COLOR_YELLOW}MD5 mismatch (kept): #{warnings}#{COLOR_RESET}" if warnings > 0
-    puts ""
-    puts "Mode: #{mode_label}"
+    @ui.blank
+    lw = 14
+    rows = [@ui.kv(@dry_run ? 'Would delete' : 'Deleted', deleted, lw)]
+    rows << @ui.kv('Skipped', skipped, lw) if skipped > 0
+    rows << @ui.kv('Mismatch kept', warnings, lw) if warnings > 0
+    rows << @ui.kv('Mode', mode_label, lw)
+    @ui.box(@dry_run ? 'Clean summary · dry run' : 'Clean summary', rows)
   end
 
   def print_summary
-    puts ""
-    puts "Import Summary"
-    puts "=============="
-    puts "Files #{@dry_run ? 'to copy' : 'copied'}: #{@processed_files}"
-    puts "Files already present (skipped): #{@duplicate_skipped}" if @duplicate_skipped > 0
-    puts "Files skipped (outside date range): #{@skipped_files}" if @skipped_files > 0
+    lw = 18
+    rows = [@ui.kv(@dry_run ? 'Files to copy' : 'Files copied', @processed_files, lw)]
+    rows << @ui.kv('Already present', @duplicate_skipped, lw) if @duplicate_skipped > 0
+    rows << @ui.kv('Outside date range', @skipped_files, lw) if @skipped_files > 0
     if @delete_after
-      puts "Source files #{@dry_run ? 'to delete' : 'deleted'} (--move): #{@deleted_sources}"
+      rows << @ui.kv(@dry_run ? 'Sources to delete' : 'Sources deleted', @deleted_sources, lw)
     end
-    puts "Mode: #{mode_label}"
+    rows << @ui.kv('Errors', @errors.length, lw) if @errors.any?
+    @ui.box(@dry_run ? 'Summary · dry run' : 'Summary', rows)
 
     if @errors.any?
-      puts "#{FAIL_SYMBOL} #{COLOR_RED}Errors encountered:#{COLOR_RESET}"
-      @errors.each { |error| puts "  - #{error}" }
+      @errors.first(10).each { |error| @ui.item(:err, error) }
+      @ui.note("…and #{@errors.length - 10} more") if @errors.length > 10
     end
 
+    @ui.blank
     handled = @processed_files + @duplicate_skipped
-    puts ""
     if @errors.empty? && handled > 0
-      puts "#{PASS_SYMBOL} #{COLOR_GREEN}#{@dry_run ? 'Dry run' : 'Import'} completed successfully!#{COLOR_RESET}"
+      @ui.item(:ok, @ui.colorize(:ok, "#{@dry_run ? 'Dry run' : 'Import'} completed successfully!"))
     elsif handled == 0 && @errors.empty?
-      puts "No files were processed."
+      @ui.item(:info, 'No files were processed.')
     else
-      puts "#{FAIL_SYMBOL} #{COLOR_RED}#{@dry_run ? 'Dry run' : 'Import'} completed with errors.#{COLOR_RESET}"
+      @ui.item(:err, @ui.colorize(:err, "#{@dry_run ? 'Dry run' : 'Import'} completed with errors."))
     end
   end
 end
@@ -606,6 +780,7 @@ end
 # Main execution
 if __FILE__ == $0
   options = {}
+  ui = UI.new
   option_parser = OptionParser.new do |opts|
     opts.banner = "Usage: ruby gopro_storm [options] [source_path...] [destination_path]"
     opts.separator ""
@@ -636,7 +811,7 @@ if __FILE__ == $0
       begin
         options[:since_date] = Date.parse(date_str)
       rescue ArgumentError
-        puts "#{GoProImporter::FAIL_SYMBOL} #{GoProImporter::COLOR_RED}Invalid date format: #{date_str}. Use YYYY-MM-DD.#{GoProImporter::COLOR_RESET}"
+        ui.item(:err, "Invalid date format: #{date_str}. Use YYYY-MM-DD.")
         exit 1
       end
     end
@@ -645,7 +820,7 @@ if __FILE__ == $0
       begin
         options[:until_date] = Date.parse(date_str)
       rescue ArgumentError
-        puts "#{GoProImporter::FAIL_SYMBOL} #{GoProImporter::COLOR_RED}Invalid date format: #{date_str}. Use YYYY-MM-DD.#{GoProImporter::COLOR_RESET}"
+        ui.item(:err, "Invalid date format: #{date_str}. Use YYYY-MM-DD.")
         exit 1
       end
     end
@@ -693,12 +868,12 @@ if __FILE__ == $0
     option_parser.parse!
 
     if options[:check] && options[:clean]
-      puts "#{GoProImporter::FAIL_SYMBOL} #{GoProImporter::COLOR_RED}Error: --check and --clean cannot be used together.#{GoProImporter::COLOR_RESET}"
+      ui.item(:err, 'Error: --check and --clean cannot be used together.')
       exit 1
     end
 
     if options[:delete_after] && (options[:check] || options[:clean])
-      puts "#{GoProImporter::FAIL_SYMBOL} #{GoProImporter::COLOR_RED}Error: --move cannot be combined with --check or --clean.#{GoProImporter::COLOR_RESET}"
+      ui.item(:err, 'Error: --move cannot be combined with --check or --clean.')
       exit 1
     end
 
@@ -711,15 +886,15 @@ if __FILE__ == $0
       ARGV.take_while { |arg| !arg.start_with?('--') && arg != Dir.pwd }
     else
       # Auto-detect GoPro volumes
-      puts "Auto-detecting GoPro volumes..."
+      ui.note('Auto-detecting GoPro volumes…')
       detected = GoProImporter.detect_gopro_volumes
       if detected.empty?
-        puts "#{GoProImporter::FAIL_SYMBOL} #{GoProImporter::COLOR_RED}No GoPro volumes detected.#{GoProImporter::COLOR_RESET}"
-        puts "Please specify volumes manually using --volumes or provide source paths directly."
-        puts "Example: ruby gopro_storm /Volumes/UNTITLED"
+        ui.item(:err, 'No GoPro volumes detected.')
+        ui.note('Specify volumes manually using --volumes or provide source paths directly.')
+        ui.note('Example: ruby gopro_storm /Volumes/UNTITLED')
         exit 1
       end
-      puts "#{GoProImporter::PASS_SYMBOL} Found GoPro volumes: #{detected.join(', ')}"
+      ui.item(:ok, "Found GoPro volumes: #{detected.join(', ')}")
       detected
     end
 
@@ -730,7 +905,7 @@ if __FILE__ == $0
     end
 
     if source_paths.empty?
-      puts "No source paths specified and auto-detection found no GoPro volumes."
+      ui.item(:err, 'No source paths specified and auto-detection found no GoPro volumes.')
       puts option_parser
       exit 1
     end
@@ -738,17 +913,17 @@ if __FILE__ == $0
     importer = GoProImporter.new(source_paths, destination_path, options[:dry_run], options[:max_files], options[:since_date], options[:until_date], options[:check], options[:clean], options[:delete_after])
     importer.run
   rescue OptionParser::InvalidOption => e
-    puts "#{GoProImporter::FAIL_SYMBOL} #{GoProImporter::COLOR_RED}Error: #{e.message}#{GoProImporter::COLOR_RESET}"
+    ui.item(:err, "Error: #{e.message}")
     puts option_parser
     exit 1
   rescue Interrupt
     # Ctrl+C: print a clean message instead of a noisy backtrace.
-    # The extra newline moves us below any in-progress progress bar.
+    # The extra newline moves us below any in-progress panel.
     puts ""
-    puts "#{GoProImporter::WARN_SYMBOL} #{GoProImporter::COLOR_YELLOW}Stopped by the user.#{GoProImporter::COLOR_RESET}"
+    ui.item(:warn, ui.colorize(:warn, 'Stopped by the user.'))
     exit 130
   rescue => e
-    puts "#{GoProImporter::FAIL_SYMBOL} #{GoProImporter::COLOR_RED}Error: #{e.message}#{GoProImporter::COLOR_RESET}"
+    ui.item(:err, "Error: #{e.message}")
     exit 1
   end
 end
