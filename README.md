@@ -1,6 +1,13 @@
 # GoPro File Import Script
 
-This Ruby script automatically imports GoPro files from an SD card and organizes them by week and year based on their metadata. 
+This Ruby script automatically imports GoPro files from an SD card and organizes them by week and year based on their metadata.
+
+![gopro_storm in action](screenshot.png)
+
+> **Why gopro_storm?**
+> - **Safer than a plain file copy** — every file is verified by SHA-256, identical files are skipped (no accidental duplicates), and source files are only deleted once a good copy is confirmed.
+> - **More control than the macOS Photos/Image Capture utilities** — files are organized into tidy `<year>_week_<week>` folders from EXIF dates, with date-range filtering, dry-run previews, and integrity checks.
+> - **Less complicated than `rsync`** — no flag soup. Auto-detects your GoPro card, shows a live btop-style progress panel, and offers simple `--check`, `--clean`, and `--move` workflows out of the box.
 
 ## Features
 
