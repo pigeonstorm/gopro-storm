@@ -254,7 +254,7 @@ class GoProImporter
     @duplicate_skipped = 0
     @deleted_sources = 0
     @errors = []
-    @md5_cache = {}
+    @checksum_cache = {}
     @ui = UI.new
   end
 
@@ -287,7 +287,7 @@ class GoProImporter
 
   def mode_label
     if @check
-      'CHECK (compare MD5, no files changed)'
+      'CHECK (compare SHA-256, no files changed)'
     elsif @clean
       @dry_run ? 'CLEAN (dry run, no files deleted)' : 'CLEAN (delete verified copies from source)'
     elsif @delete_after
@@ -560,7 +560,7 @@ class GoProImporter
     extension = File.extname(filename)
 
     # If a same-named file already exists and is byte-for-byte identical
-    # (verified by MD5), there's nothing to copy — skip it. With --move the
+    # (verified by checksum), there's nothing to copy — skip it. With --move the
     # source file is removed since it's already safely stored.
     if File.exist?(destination_file) && files_identical?(source_file, destination_file)
       @duplicate_skipped += 1
@@ -594,12 +594,12 @@ class GoProImporter
     :copied
   end
 
-  # Compare two files cheaply (size first, then MD5) to decide if they are
+  # Compare two files cheaply (size first, then checksum) to decide if they are
   # byte-for-byte identical.
   def files_identical?(file_a, file_b)
     return false unless File.size(file_a) == File.size(file_b)
 
-    file_md5(file_a) == file_md5(file_b)
+    file_checksum(file_a) == file_checksum(file_b)
   end
 
   # Delete a source file (respecting dry-run) and track the count.
@@ -610,7 +610,7 @@ class GoProImporter
     @errors << "Failed to delete source #{source_file}: #{e.message}"
   end
 
-  # --- MD5 verification helpers (used by --check and --clean) ---
+  # --- checksum verification helpers (used by --check and --clean) ---
 
   # Collect source files, applying the same date filtering used for import.
   def collect_source_files
@@ -655,15 +655,18 @@ class GoProImporter
     "#{name}#{extension}".downcase
   end
 
-  def file_md5(path)
-    @md5_cache[path] ||= Digest::MD5.file(path).hexdigest
+  # SHA-256 is used rather than MD5: on modern CPUs (Apple Silicon / x86 with
+  # SHA-NI) it is hardware-accelerated and ~3x faster than MD5, while also being
+  # far more collision-resistant. Digest#file streams the file in chunks.
+  def file_checksum(path)
+    @checksum_cache[path] ||= Digest::SHA256.file(path).hexdigest
   end
 
   def run_check
     source_files = collect_source_files
     destination_index = build_destination_index
 
-    @ui.note("Comparing MD5 of #{source_files.length} source file(s) against destination copies…")
+    @ui.note("Comparing SHA-256 of #{source_files.length} source file(s) against destination copies…")
     @ui.blank
 
     matched = 0
@@ -680,9 +683,9 @@ class GoProImporter
         next
       end
 
-      source_digest = file_md5(source_file)
+      source_digest = file_checksum(source_file)
 
-      if candidates.any? { |candidate| file_md5(candidate) == source_digest }
+      if candidates.any? { |candidate| file_checksum(candidate) == source_digest }
         matched += 1
         @ui.item(:ok, basename)
       else
@@ -727,9 +730,9 @@ class GoProImporter
         next
       end
 
-      source_digest = file_md5(source_file)
+      source_digest = file_checksum(source_file)
 
-      if candidates.any? { |candidate| file_md5(candidate) == source_digest }
+      if candidates.any? { |candidate| file_checksum(candidate) == source_digest }
         File.delete(source_file) unless @dry_run
         verb = @dry_run ? 'would delete' : 'deleted'
         @ui.item(:ok, "#{@ui.colorize(:ok, verb)}  #{basename} (verified copy exists)")
@@ -829,11 +832,11 @@ if __FILE__ == $0
       options[:since_date] = Date.today - 7
     end
 
-    opts.on("--check", "Compare MD5 checksums between source (camera) and destination copies (no changes made)") do
+    opts.on("--check", "Compare SHA-256 checksums between source (camera) and destination copies (no changes made)") do
       options[:check] = true
     end
 
-    opts.on("--clean", "Delete source files that have a verified MD5-matching copy in the destination") do
+    opts.on("--clean", "Delete source files that have a verified checksum-matching copy in the destination") do
       options[:clean] = true
     end
 
@@ -857,8 +860,8 @@ if __FILE__ == $0
     opts.separator "  ruby gopro_storm --until=2025-06-30           # Import files up to Jun 30, 2025"
     opts.separator "  ruby gopro_storm --since=2025-01-01 --until=2025-03-31  # Import a date range"
     opts.separator "  ruby gopro_storm --last-week                  # Import files from the last 7 days"
-    opts.separator "  ruby gopro_storm --check --volumes /Volumes/UNTITLED #{DEFAULT_DESTINATION_PATH}  # Verify MD5 of camera files against copies"
-    opts.separator "  ruby gopro_storm --clean --volumes /Volumes/UNTITLED #{DEFAULT_DESTINATION_PATH}  # Delete camera files already copied (verified by MD5)"
+    opts.separator "  ruby gopro_storm --check --volumes /Volumes/UNTITLED #{DEFAULT_DESTINATION_PATH}  # Verify SHA-256 of camera files against copies"
+    opts.separator "  ruby gopro_storm --clean --volumes /Volumes/UNTITLED #{DEFAULT_DESTINATION_PATH}  # Delete camera files already copied (verified by checksum)"
     opts.separator "  ruby gopro_storm --clean --dry-run --volumes /Volumes/UNTITLED #{DEFAULT_DESTINATION_PATH}  # Preview which camera files would be deleted"
     opts.separator "  ruby gopro_storm --move --volumes /Volumes/UNTITLED #{DEFAULT_DESTINATION_PATH}  # Import, then delete each source file once verified"
     opts.separator "  ruby gopro_storm --volumes /Volumes/UNTITLED #{DEFAULT_DESTINATION_PATH}  # Import from volume to destination"

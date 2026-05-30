@@ -10,14 +10,14 @@ This Ruby script automatically imports GoPro files from an SD card and organizes
 - Extracts creation date from EXIF metadata
 - Organizes files into directories named `<year>_week_<week>`
 - Preserves file metadata during copying
-- **Skips re-copying** files that are already present and byte-for-byte identical (verified by MD5)
+- **Skips re-copying** files that are already present and byte-for-byte identical (verified by SHA-256)
 - Handles genuine filename collisions (same name, different content) by adding a numeric suffix
 - **Move mode** (`--move`) deletes each source file once a verified copy exists in the destination
 - Comprehensive error handling and reporting
 - **btop-style terminal UI**: rounded panels with bracketed titles and a smooth gradient progress panel that updates in place (auto-disabled when output is not a TTY or when `NO_COLOR` is set)
 - **Dry-run mode** (`--dry-run`) to preview operations without copying files
-- **Integrity check** (`--check`) to compare MD5 checksums between the camera and the copied files
-- **Safe cleanup** (`--clean`) to delete camera files only after verifying a matching MD5 copy exists
+- **Integrity check** (`--check`) to compare SHA-256 checksums between the camera and the copied files
+- **Safe cleanup** (`--clean`) to delete camera files only after verifying a matching SHA-256 copy exists
 
 ## Prerequisites
 
@@ -84,15 +84,15 @@ ruby gopro_storm --dry-run --volumes /Volumes/A,/Volumes/B /path/to/destination
 - `--since DATE`: Only process files created on or after `DATE` (`YYYY-MM-DD`)
 - `--until DATE`: Only process files created on or before `DATE` (`YYYY-MM-DD`)
 - `--last-week`: Only process files from the last 7 days
-- `--check`: Compare MD5 checksums between the source (camera) and the destination copies. Read-only — no files are changed.
-- `--clean`: Delete source (camera) files that already have a verified MD5-matching copy in the destination. Combine with `--dry-run` to preview deletions.
+- `--check`: Compare SHA-256 checksums between the source (camera) and the destination copies. Read-only — no files are changed.
+- `--clean`: Delete source (camera) files that already have a verified SHA-256-matching copy in the destination. Combine with `--dry-run` to preview deletions.
 - `--move`: Import normally, then delete each source file once it is safely copied/verified in the destination (i.e. move instead of copy). Cannot be combined with `--check` or `--clean`. Combine with `--dry-run` to preview.
 - `--help`, `-h`: Show help message
 
 ### Duplicate Handling
 
 When a file with the same name already exists in the target week directory, the script
-compares the two files (size first, then MD5):
+compares the two files (size first, then SHA-256):
 
 - **Identical** → the copy is skipped (no duplicate is created). With `--move`, the source
   file is deleted since it is already safely stored.
@@ -107,17 +107,17 @@ After importing, you can verify the copies are intact and free up space on the S
 
 `--check` walks every GoPro file on the source and looks for a matching copy in the
 destination (matching by filename, including numeric duplicate suffixes such as
-`GOPR0001_1.MP4`), then compares MD5 checksums:
+`GOPR0001_1.MP4`), then compares SHA-256 checksums:
 
-- ✔ **Verified**: a destination copy with an identical MD5 was found
-- ⚠ **MD5 mismatch**: a copy exists but its checksum differs
+- ✔ **Verified**: a destination copy with an identical SHA-256 was found
+- ⚠ **Checksum mismatch**: a copy exists but its checksum differs
 - ✘ **Missing**: no copy was found in the destination
 
 `--clean` performs the same comparison and then removes source files that are safe to delete:
 
-- ✔ **Deleted**: a verified MD5-matching copy exists, so the source file is removed
+- ✔ **Deleted**: a verified SHA-256-matching copy exists, so the source file is removed
 - **Skip**: no copy was found in the destination, so the file is left untouched (a skip message is shown)
-- ⚠ **Warning**: a copy exists but the MD5 does not match — the source file is **kept** and a warning is displayed
+- ⚠ **Warning**: a copy exists but the SHA-256 does not match — the source file is **kept** and a warning is displayed
 
 > **Note:** Both modes require the destination to already exist (it is never created),
 > and they respect the `--since`, `--until`, and `--last-week` date filters.
@@ -220,7 +220,7 @@ The script tries to extract creation dates from the following EXIF fields (in or
 ## Error Handling
 
 - Files without readable metadata fall back to file modification time
-- Identical files already in the destination are skipped (verified by MD5); genuine name collisions get a numeric suffix
+- Identical files already in the destination are skipped (verified by SHA-256); genuine name collisions get a numeric suffix
 - All errors are reported but don't stop the import process
 - A summary is provided at the end showing total files processed and any errors
 
