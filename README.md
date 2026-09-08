@@ -22,6 +22,7 @@ This Ruby script automatically imports GoPro files from an SD card and organizes
 - **Move mode** (`--move`) deletes each source file once a verified copy exists in the destination
 - Comprehensive error handling and reporting
 - **btop-style terminal UI**: rounded panels with bracketed titles and a smooth gradient progress panel that updates in place (auto-disabled when output is not a TTY or when `NO_COLOR` is set)
+- **Live transfer speed**: the progress panel shows a running average copy speed, and the summary reports total data copied and average speed for the run
 - **Dry-run mode** (`--dry-run`) to preview operations without copying files
 - **Integrity check** (`--check`) to compare SHA-256 checksums between the camera and the copied files
 - **Safe cleanup** (`--clean`) to delete camera files only after verifying a matching SHA-256 copy exists

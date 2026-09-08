@@ -174,13 +174,15 @@ class UI
     @io.puts "Processing #{total} file(s)..." unless @rich
   end
 
-  def progress(done, file, dir, action)
+  def progress(done, file, dir, action, speed = nil)
     unless @rich
-      @io.puts "[#{done}/#{@p_total}] #{action}: #{file}"
+      line = "[#{done}/#{@p_total}] #{action}: #{file}"
+      line += " (#{speed})" if speed
+      @io.puts line
       return
     end
 
-    lines = progress_lines(done, file, dir, action)
+    lines = progress_lines(done, file, dir, action, speed)
     @io.print "\e[#{@p_lines}A" if @p_lines.positive?
     lines.each { |line| @io.print "\r\e[2K#{line}\n" }
     @p_lines = lines.length
@@ -213,10 +215,11 @@ class UI
     color(*[0, 1, 2].map { |k| (a[k] + ((b[k] - a[k]) * f)).round })
   end
 
-  def progress_lines(done, file, dir, action)
+  def progress_lines(done, file, dir, action, speed = nil)
     fraction = @p_total.positive? ? done.to_f / @p_total : 1.0
     pct = (fraction * 100).round
     suffix = "#{pct.to_s.rjust(3)}%  #{c_dim}#{done}/#{@p_total}#{reset}"
+    suffix += "  #{c_dim}#{speed}#{reset}" if speed
     label_width = 5
     bar_len = [content_width - visible(suffix) - 2, 10].max
     [
@@ -255,6 +258,8 @@ class GoProImporter
     @deleted_sources = 0
     @errors = []
     @checksum_cache = {}
+    @total_bytes_copied = 0
+    @total_copy_time = 0.0
     @ui = UI.new
   end
 
@@ -340,7 +345,7 @@ class GoProImporter
     gopro_files.each do |file_path|
       process_file(file_path)
       done += 1
-      @ui.progress(done, @current_file, @current_dir, @current_action)
+      @ui.progress(done, @current_file, @current_dir, @current_action, transfer_speed_label)
     end
 
     @ui.progress_finish
@@ -577,7 +582,11 @@ class GoProImporter
     end
 
     unless @dry_run
+      file_size = File.size(source_file)
+      start_time = Time.now
       FileUtils.cp(source_file, destination_file, preserve: true)
+      @total_bytes_copied += file_size
+      @total_copy_time += (Time.now - start_time)
     end
 
     # Only remove the source after confirming the copy is intact.
@@ -752,6 +761,30 @@ class GoProImporter
     @ui.box(@dry_run ? 'Clean summary · dry run' : 'Clean summary', rows)
   end
 
+  # Running average transfer speed so far, or nil until at least one file has
+  # been copied (used to annotate the live progress panel).
+  def transfer_speed_label
+    return nil if @total_copy_time <= 0
+
+    format_speed(@total_bytes_copied / @total_copy_time)
+  end
+
+  def format_speed(bytes_per_second)
+    if bytes_per_second >= 1024 * 1024
+      "%.1f MB/s" % (bytes_per_second / (1024.0 * 1024.0))
+    else
+      "%.1f KB/s" % (bytes_per_second / 1024.0)
+    end
+  end
+
+  def format_bytes(bytes)
+    if bytes >= 1024 * 1024 * 1024
+      "%.2f GB" % (bytes / (1024.0 * 1024.0 * 1024.0))
+    else
+      "%.1f MB" % (bytes / (1024.0 * 1024.0))
+    end
+  end
+
   def print_summary
     lw = 18
     rows = [@ui.kv(@dry_run ? 'Files to copy' : 'Files copied', @processed_files, lw)]
@@ -759,6 +792,10 @@ class GoProImporter
     rows << @ui.kv('Outside date range', @skipped_files, lw) if @skipped_files > 0
     if @delete_after
       rows << @ui.kv(@dry_run ? 'Sources to delete' : 'Sources deleted', @deleted_sources, lw)
+    end
+    if @total_copy_time > 0
+      rows << @ui.kv('Data copied', format_bytes(@total_bytes_copied), lw)
+      rows << @ui.kv('Average speed', format_speed(@total_bytes_copied / @total_copy_time), lw)
     end
     rows << @ui.kv('Errors', @errors.length, lw) if @errors.any?
     @ui.box(@dry_run ? 'Summary · dry run' : 'Summary', rows)
